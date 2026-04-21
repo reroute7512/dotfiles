@@ -11,8 +11,12 @@ set -euo pipefail
 
 # ─── Configuratie ────────────────────────────────────────────────────────────
 
+[[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/dotf/env" ]] && \
+    source "${XDG_CONFIG_HOME:-$HOME/.config}/dotf/env"
+
 DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
-DOTFILES_GIT_REMOTE="${DOTFILES_GIT_REMOTE:-}"   # optioneel, stel in via env
+DOTFILES_GIT_REMOTE="${DOTFILES_GIT_REMOTE:-${DOTFILES_GIT:-}}"
+DOTFILES_BRANCH="${DOTFILES_BRANCH:-main}"
 
 # ─── Kleuren ─────────────────────────────────────────────────────────────────
 
@@ -74,28 +78,38 @@ ${BOLD}GEBRUIK${RESET}
 
 ${BOLD}COMMANDO'S${RESET}
   ${CYAN}init${RESET}               Maak de dotfiles repo aan
-  ${CYAN}add${RESET} <bestand...>   Voeg bestand(en) toe aan de repo
+  ${CYAN}add${RESET} [-r] <pad...>   Voeg bestand(en) of map (-r) toe aan de repo
   ${CYAN}apply${RESET}              Kopieer alle bestanden van repo → ~
   ${CYAN}re-add${RESET}             Kopieer gewijzigde bestanden van ~ → repo
   ${CYAN}status${RESET}             Toon de status van alle beheerde bestanden
   ${CYAN}diff${RESET} [bestand]     Toon verschillen tussen repo en ~
   ${CYAN}list${RESET}               Toon alle beheerde bestanden
   ${CYAN}remove${RESET} <bestand>   Verwijder een bestand uit de repo
+  ${CYAN}restore${RESET} <best...>  Herstel één of meer bestanden van repo → ~
   ${CYAN}edit${RESET} <bestand>     Open een beheerd bestand in \$EDITOR
+  ${CYAN}packages${RESET}           Toon/beheer de pakkettenlijst
+  ${CYAN}bootstrap${RESET}          Installeer pakketten + apply dotfiles
+  ${CYAN}push${RESET}               Push naar remote (origin/$DOTFILES_BRANCH)
+  ${CYAN}pull${RESET}               Pull van remote + apply dotfiles
+  ${CYAN}clone${RESET} [url]        Clone remote repo (nieuwe machine)
   ${CYAN}git${RESET} <args...>      Voer een git commando uit in de repo
   ${CYAN}help${RESET}               Toon deze hulptekst
 
 ${BOLD}CONFIGURATIE${RESET} (via omgevingsvariabelen)
   DOTFILES_DIR         Locatie van de repo (standaard: ~/.dotfiles)
   DOTFILES_GIT_REMOTE  Optioneel git remote (bv. git@github.com:jou/dotfiles.git)
+  DOTFILES_BRANCH      Branch naam (standaard: main)
 
 ${BOLD}VOORBEELDEN${RESET}
   dotf init
   dotf add ~/.bashrc ~/.vimrc ~/.config/nvim/init.lua
+  dotf add -r ~/.config/nvim
+  dotf packages add git vim curl ripgrep
+  dotf bootstrap
   dotf status
   dotf diff ~/.bashrc
   dotf re-add
-  dotf git push
+  dotf push
 
 EOF
 }
@@ -121,16 +135,36 @@ cmd_init() {
 
 cmd_add() {
     require_repo
-    [[ $# -gt 0 ]] || die "Gebruik: dotf add <bestand...>"
+
+    local recursive=0
+    local args=()
+    for arg in "$@"; do
+        [[ "$arg" == "-r" || "$arg" == "--recursive" ]] && recursive=1 || args+=("$arg")
+    done
+    set -- "${args[@]}"
+    [[ $# -gt 0 ]] || die "Gebruik: dotf add [-r] <bestand|map...>"
 
     local added=0
     for src in "$@"; do
         src="$(realpath "$src")"
-        [[ -f "$src" ]] || { warn "Geen bestand: $src"; continue; }
+
+        if [[ -d "$src" ]]; then
+            (( recursive )) || { warn "Map overgeslagen (gebruik -r om recursief toe te voegen): ${src#$HOME/}"; continue; }
+            while IFS= read -r file; do
+                local dest
+                dest="$(repo_path "$file")"
+                mkdir -p "$(dirname "$dest")"
+                cp "$file" "$dest"
+                ok "Toegevoegd: ${file#$HOME/}"
+                (( added++ )) || true
+            done < <(find "$src" -type f | sort)
+            continue
+        fi
+
+        [[ -f "$src" ]] || { warn "Geen bestand of map: $src"; continue; }
 
         local dest
         dest="$(repo_path "$src")"
-
         mkdir -p "$(dirname "$dest")"
         cp "$src" "$dest"
         ok "Toegevoegd: ${src#$HOME/}"
@@ -331,6 +365,147 @@ cmd_restore() {
     done
 }
 
+cmd_packages() {
+    require_repo
+    local pkgfile="$DOTFILES_DIR/packages.txt"
+    local subcmd="${1:-list}"
+    shift || true
+
+    case "$subcmd" in
+        list)
+            if [[ ! -f "$pkgfile" ]]; then
+                info "Nog geen packages.txt — voeg pakketten toe met: dotf packages add <naam>"
+                return 0
+            fi
+            header "Beheerde pakketten"
+            echo ""
+            grep -v '^#' "$pkgfile" | grep -v '^[[:space:]]*$' | while read -r pkg; do
+                echo "  $pkg"
+            done
+            ;;
+        add)
+            [[ $# -gt 0 ]] || die "Gebruik: dotf packages add <pakket...>"
+            touch "$pkgfile"
+            for pkg in "$@"; do
+                if grep -qx "$pkg" "$pkgfile" 2>/dev/null; then
+                    warn "Al aanwezig: $pkg"
+                else
+                    echo "$pkg" >> "$pkgfile"
+                    ok "Toegevoegd: $pkg"
+                fi
+            done
+            git -C "$DOTFILES_DIR" add packages.txt
+            git -C "$DOTFILES_DIR" commit -q -m "packages: $*"
+            ;;
+        remove)
+            [[ $# -gt 0 ]] || die "Gebruik: dotf packages remove <pakket>"
+            [[ -f "$pkgfile" ]] || die "packages.txt niet gevonden"
+            for pkg in "$@"; do
+                sed -i "/^${pkg}$/d" "$pkgfile"
+                ok "Verwijderd: $pkg"
+            done
+            git -C "$DOTFILES_DIR" add packages.txt
+            git -C "$DOTFILES_DIR" commit -q -m "packages remove: $*"
+            ;;
+        *)
+            die "Gebruik: dotf packages [list|add|remove]"
+            ;;
+    esac
+}
+
+cmd_bootstrap() {
+    require_repo
+    local pkgfile="$DOTFILES_DIR/packages.txt"
+
+    # ── Detecteer pakketbeheerder ──────────────────────────────────────────
+    local pm=""
+    local pm_install=""
+
+    if command -v dnf &>/dev/null; then
+        pm="dnf"
+        pm_install="sudo dnf install -y"
+    elif command -v apt-get &>/dev/null; then
+        pm="apt"
+        pm_install="sudo apt-get install -y"
+    elif command -v pacman &>/dev/null; then
+        pm="pacman"
+        pm_install="sudo pacman -S --noconfirm"
+    elif command -v zypper &>/dev/null; then
+        pm="zypper"
+        pm_install="sudo zypper install -y"
+    elif command -v brew &>/dev/null; then
+        pm="brew"
+        pm_install="brew install"
+    elif command -v apk &>/dev/null; then
+        pm="apk"
+        pm_install="sudo apk add"
+    else
+        die "Geen ondersteunde pakketbeheerder gevonden (dnf/apt/pacman/zypper/brew/apk)"
+    fi
+
+    info "Pakketbeheerder: ${BOLD}$pm${RESET}"
+
+    # ── Pakketten installeren ──────────────────────────────────────────────
+    if [[ -f "$pkgfile" ]]; then
+        local pkgs=()
+        while IFS= read -r line; do
+            # Sla lege regels en commentaar over
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            pkgs+=("$line")
+        done < "$pkgfile"
+
+        if [[ ${#pkgs[@]} -gt 0 ]]; then
+            header "Pakketten installeren (${#pkgs[@]} stuks)"
+            $pm_install "${pkgs[@]}"
+            ok "Pakketten geïnstalleerd"
+        else
+            warn "packages.txt is leeg"
+        fi
+    else
+        warn "Geen packages.txt gevonden — stap overgeslagen"
+        info "Voeg pakketten toe met: dotf packages add git vim curl"
+    fi
+
+    # ── Dotfiles toepassen ─────────────────────────────────────────────────
+    header "Dotfiles toepassen"
+    cmd_apply
+
+    ok "Bootstrap voltooid"
+}
+
+cmd_push() {
+    require_repo
+    local remote_url
+    remote_url="${DOTFILES_GIT_REMOTE:-$(git -C "$DOTFILES_DIR" remote get-url origin 2>/dev/null || true)}"
+    [[ -n "$remote_url" ]] || die "Geen remote ingesteld\nStel DOTFILES_GIT_REMOTE in of gebruik: dotf git remote add origin <url>"
+    info "Pushen naar origin/$DOTFILES_BRANCH..."
+    git -C "$DOTFILES_DIR" push -u origin "$DOTFILES_BRANCH"
+    ok "Gepusht naar $remote_url ($DOTFILES_BRANCH)"
+}
+
+cmd_pull() {
+    require_repo
+    info "Pullen van origin/$DOTFILES_BRANCH..."
+    git -C "$DOTFILES_DIR" pull --ff-only origin "$DOTFILES_BRANCH"
+    ok "Repo bijgewerkt"
+    header "Dotfiles toepassen"
+    cmd_apply
+}
+
+cmd_clone() {
+    local remote_url="${1:-${DOTFILES_GIT_REMOTE:-}}"
+    [[ -n "$remote_url" ]] || die "Gebruik: dotf clone <remote-url>\nOf stel DOTFILES_GIT_REMOTE in"
+
+    if [[ -d "$DOTFILES_DIR" ]]; then
+        warn "Repo bestaat al: $DOTFILES_DIR — gebruik 'dotf pull' om bij te werken"
+        return 1
+    fi
+
+    info "Clonen van $remote_url naar $DOTFILES_DIR..."
+    git clone "$remote_url" "$DOTFILES_DIR"
+    ok "Gecloned"
+}
+
 cmd_git() {
     require_repo
     git -C "$DOTFILES_DIR" "$@"
@@ -353,6 +528,11 @@ main() {
         remove)  cmd_remove "$@" ;;
         restore) cmd_restore "$@" ;;
         edit)    cmd_edit "$@" ;;
+        packages) cmd_packages "$@" ;;
+        bootstrap) cmd_bootstrap "$@" ;;
+        push)      cmd_push "$@" ;;
+        pull)      cmd_pull "$@" ;;
+        clone)     cmd_clone "$@" ;;
         git)     cmd_git "$@" ;;
         help|-h|--help) cmd_help ;;
         *)       die "Onbekend commando: '$cmd'\nRun 'dotf help' voor een overzicht" ;;
