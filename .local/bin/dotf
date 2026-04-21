@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# dotf — een eenvoudige dotfiles beheerder (copy-based, geen symlinks)
+# Gebruik: dotf <commando> [opties]
+#
+# Installatie:
+#   chmod +x dotf
+#   sudo mv dotf /usr/local/bin/dotf
+#   dotf init
+
+set -euo pipefail
+
+# ─── Configuratie ────────────────────────────────────────────────────────────
+
+DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
+DOTFILES_GIT_REMOTE="${DOTFILES_GIT_REMOTE:-}"   # optioneel, stel in via env
+
+# ─── Kleuren ─────────────────────────────────────────────────────────────────
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
+
+info()    { echo -e "${CYAN}→${RESET} $*"; }
+ok()      { echo -e "${GREEN}✔${RESET} $*"; }
+warn()    { echo -e "${YELLOW}⚠${RESET} $*"; }
+error()   { echo -e "${RED}✘${RESET} $*" >&2; }
+die()     { error "$*"; exit 1; }
+header()  { echo -e "\n${BOLD}$*${RESET}"; }
+
+# ─── Hulpfuncties ─────────────────────────────────────────────────────────────
+
+# Geeft het pad in de repo terug voor een gegeven ~ pad
+repo_path() {
+    local src
+    src="$(realpath "$1")"
+    [[ "$src" == "$HOME/"* ]] || die "'$1' ligt niet binnen \$HOME"
+    echo "$DOTFILES_DIR/${src#$HOME/}"
+}
+
+# Geeft het ~ pad terug voor een gegeven repo pad
+home_path() {
+    local repo
+    repo="$(realpath "$1")"
+    [[ "$repo" == "$DOTFILES_DIR/"* ]] || die "'$1' ligt niet binnen de repo"
+    echo "$HOME/${repo#$DOTFILES_DIR/}"
+}
+
+# Controleer of de repo bestaat
+require_repo() {
+    [[ -d "$DOTFILES_DIR" ]] || die "Repo niet gevonden: $DOTFILES_DIR\nRun eerst: dotf init"
+}
+
+# Alle beheerde bestanden (paden in de repo)
+all_repo_files() {
+    find "$DOTFILES_DIR" \
+        -not -path "$DOTFILES_DIR/.git/*" \
+        -not -name ".gitignore" \
+        -type f \
+        | sort
+}
+
+# ─── Commando's ───────────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<EOF
+
+${BOLD}dotf${RESET} — dotfiles beheerder (copy-based)
+
+${BOLD}GEBRUIK${RESET}
+  dotf <commando> [argumenten]
+
+${BOLD}COMMANDO'S${RESET}
+  ${CYAN}init${RESET}               Maak de dotfiles repo aan
+  ${CYAN}add${RESET} <bestand...>   Voeg bestand(en) toe aan de repo
+  ${CYAN}apply${RESET}              Kopieer alle bestanden van repo → ~
+  ${CYAN}re-add${RESET}             Kopieer gewijzigde bestanden van ~ → repo
+  ${CYAN}status${RESET}             Toon de status van alle beheerde bestanden
+  ${CYAN}diff${RESET} [bestand]     Toon verschillen tussen repo en ~
+  ${CYAN}list${RESET}               Toon alle beheerde bestanden
+  ${CYAN}remove${RESET} <bestand>   Verwijder een bestand uit de repo
+  ${CYAN}edit${RESET} <bestand>     Open een beheerd bestand in \$EDITOR
+  ${CYAN}git${RESET} <args...>      Voer een git commando uit in de repo
+  ${CYAN}help${RESET}               Toon deze hulptekst
+
+${BOLD}CONFIGURATIE${RESET} (via omgevingsvariabelen)
+  DOTFILES_DIR         Locatie van de repo (standaard: ~/.dotfiles)
+  DOTFILES_GIT_REMOTE  Optioneel git remote (bv. git@github.com:jou/dotfiles.git)
+
+${BOLD}VOORBEELDEN${RESET}
+  dotf init
+  dotf add ~/.bashrc ~/.vimrc ~/.config/nvim/init.lua
+  dotf status
+  dotf diff ~/.bashrc
+  dotf re-add
+  dotf git push
+
+EOF
+}
+
+cmd_init() {
+    if [[ -d "$DOTFILES_DIR" ]]; then
+        warn "Repo bestaat al: $DOTFILES_DIR"
+        return 0
+    fi
+
+    mkdir -p "$DOTFILES_DIR"
+    git -C "$DOTFILES_DIR" init -q
+    echo ".DS_Store" > "$DOTFILES_DIR/.gitignore"
+
+    if [[ -n "$DOTFILES_GIT_REMOTE" ]]; then
+        git -C "$DOTFILES_DIR" remote add origin "$DOTFILES_GIT_REMOTE"
+        ok "Remote ingesteld: $DOTFILES_GIT_REMOTE"
+    fi
+
+    ok "Repo aangemaakt: $DOTFILES_DIR"
+    info "Voeg bestanden toe met: dotf add ~/.bashrc"
+}
+
+cmd_add() {
+    require_repo
+    [[ $# -gt 0 ]] || die "Gebruik: dotf add <bestand...>"
+
+    local added=0
+    for src in "$@"; do
+        src="$(realpath "$src")"
+        [[ -f "$src" ]] || { warn "Geen bestand: $src"; continue; }
+
+        local dest
+        dest="$(repo_path "$src")"
+
+        mkdir -p "$(dirname "$dest")"
+        cp "$src" "$dest"
+        ok "Toegevoegd: ${src#$HOME/}"
+        (( added++ )) || true
+    done
+
+    if (( added > 0 )); then
+        git -C "$DOTFILES_DIR" add -A
+        git -C "$DOTFILES_DIR" commit -q -m "add: $(date '+%Y-%m-%d %H:%M') — $added bestand(en)"
+        ok "Gecommit naar repo"
+    fi
+}
+
+cmd_apply() {
+    require_repo
+    local count=0
+    local skipped=0
+
+    while IFS= read -r repo_file; do
+        local target
+        target="$(home_path "$repo_file")"
+        mkdir -p "$(dirname "$target")"
+
+        if [[ -f "$target" ]] && diff -q "$repo_file" "$target" &>/dev/null; then
+            (( skipped++ )) || true
+            continue
+        fi
+
+        cp "$repo_file" "$target"
+        ok "Toegepast: ${target#$HOME/}"
+        (( count++ )) || true
+    done < <(all_repo_files)
+
+    echo ""
+    info "$count bestand(en) bijgewerkt, $skipped al actueel"
+}
+
+cmd_readd() {
+    require_repo
+    local count=0
+
+    while IFS= read -r repo_file; do
+        local target
+        target="$(home_path "$repo_file")"
+
+        if [[ ! -f "$target" ]]; then
+            warn "Niet gevonden in ~: ${target#$HOME/}"
+            continue
+        fi
+
+        if diff -q "$repo_file" "$target" &>/dev/null; then
+            continue
+        fi
+
+        cp "$target" "$repo_file"
+        ok "Bijgewerkt:  ${target#$HOME/}"
+        (( count++ )) || true
+    done < <(all_repo_files)
+
+    if (( count > 0 )); then
+        git -C "$DOTFILES_DIR" add -A
+        git -C "$DOTFILES_DIR" commit -q -m "re-add: $(date '+%Y-%m-%d %H:%M') — $count bestand(en)"
+        ok "Gecommit naar repo"
+    else
+        info "Niets te synchroniseren"
+    fi
+}
+
+cmd_status() {
+    require_repo
+    header "Status dotfiles"
+
+    local ok_count=0 mod_count=0 miss_count=0
+
+    while IFS= read -r repo_file; do
+        local target
+        target="$(home_path "$repo_file")"
+        local rel="${target#$HOME/}"
+
+        if [[ ! -f "$target" ]]; then
+            echo -e "  ${RED}ONTBREEKT ${RESET} $rel"
+            (( miss_count++ )) || true
+        elif ! diff -q "$repo_file" "$target" &>/dev/null; then
+            echo -e "  ${YELLOW}GEWIJZIGD ${RESET} $rel"
+            (( mod_count++ )) || true
+        else
+            echo -e "  ${GREEN}OK        ${RESET} $rel"
+            (( ok_count++ )) || true
+        fi
+    done < <(all_repo_files)
+
+    echo ""
+    echo -e "  ${GREEN}$ok_count actueel${RESET}  ${YELLOW}$mod_count gewijzigd${RESET}  ${RED}$miss_count ontbreekt${RESET}"
+
+    if (( mod_count > 0 )); then
+        echo ""
+        info "Gebruik 'dotf re-add' om wijzigingen naar de repo te kopiëren"
+        info "Gebruik 'dotf apply' om repo-versies terug te zetten"
+    fi
+}
+
+cmd_diff() {
+    require_repo
+
+    if [[ $# -gt 0 ]]; then
+        local src
+        src="$(realpath "$1")"
+        local repo_file
+        repo_file="$(repo_path "$src")"
+        [[ -f "$repo_file" ]] || die "Niet beheerd: $1"
+        diff --color=auto -u "$repo_file" "$src" || true
+        return 0
+    fi
+
+    # Alle gewijzigde bestanden
+    local found=0
+    while IFS= read -r repo_file; do
+        local target
+        target="$(home_path "$repo_file")"
+        [[ -f "$target" ]] || continue
+        if ! diff -q "$repo_file" "$target" &>/dev/null; then
+            echo -e "\n${BOLD}── ${target#$HOME/} ──${RESET}"
+            diff --color=auto -u "$repo_file" "$target" || true
+            found=1
+        fi
+    done < <(all_repo_files)
+
+    (( found )) || info "Geen verschillen gevonden"
+}
+
+cmd_list() {
+    require_repo
+    header "Beheerde bestanden in $DOTFILES_DIR"
+    echo ""
+    while IFS= read -r repo_file; do
+        echo "  ${repo_file#$DOTFILES_DIR/}"
+    done < <(all_repo_files)
+}
+
+cmd_remove() {
+    require_repo
+    [[ $# -gt 0 ]] || die "Gebruik: dotf remove <bestand>"
+
+    local src
+    src="$(realpath "$1")"
+    local repo_file
+    repo_file="$(repo_path "$src")"
+
+    [[ -f "$repo_file" ]] || die "Niet beheerd: $1"
+
+    rm "$repo_file"
+    git -C "$DOTFILES_DIR" add -A
+    git -C "$DOTFILES_DIR" commit -q -m "remove: ${src#$HOME/}"
+    ok "Verwijderd uit repo: ${src#$HOME/}"
+    warn "Het bestand in ~ is NIET verwijderd"
+}
+
+cmd_edit() {
+    require_repo
+    [[ $# -gt 0 ]] || die "Gebruik: dotf edit <bestand>"
+
+    local src
+    src="$(realpath "$1")"
+    local repo_file
+    repo_file="$(repo_path "$src")"
+
+    [[ -f "$repo_file" ]] || die "Niet beheerd: $1\nVoeg het eerst toe met: dotf add $1"
+
+    local editor="${EDITOR:-nano}"
+    "$editor" "$repo_file"
+
+    # Na bewerken: automatisch re-apply naar ~
+    cp "$repo_file" "$src"
+    git -C "$DOTFILES_DIR" add -A
+    if ! git -C "$DOTFILES_DIR" diff --cached --quiet; then
+        git -C "$DOTFILES_DIR" commit -q -m "edit: ${src#$HOME/}"
+        ok "Opgeslagen en toegepast: ${src#$HOME/}"
+    fi
+}
+
+cmd_restore() {
+    require_repo
+    [[ $# -gt 0 ]] || die "Gebruik: dotf restore <bestand...>"
+
+    for src in "$@"; do
+        src="$(realpath "$src")"
+        local repo_file
+        repo_file="$(repo_path "$src")"
+
+        [[ -f "$repo_file" ]] || die "Niet beheerd: $src"
+
+        if [[ -f "$src" ]]; then
+            warn "Overschrijft: ${src#$HOME/}"
+        fi
+
+        cp "$repo_file" "$src"
+        ok "Hersteld: ${src#$HOME/}"
+    done
+}
+
+cmd_git() {
+    require_repo
+    git -C "$DOTFILES_DIR" "$@"
+}
+
+# ─── Dispatcher ───────────────────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        init)    cmd_init "$@" ;;
+        add)     cmd_add "$@" ;;
+        apply)   cmd_apply "$@" ;;
+        re-add)  cmd_readd "$@" ;;
+        status)  cmd_status "$@" ;;
+        diff)    cmd_diff "$@" ;;
+        list)    cmd_list "$@" ;;
+        remove)  cmd_remove "$@" ;;
+        restore) cmd_restore "$@" ;;
+        edit)    cmd_edit "$@" ;;
+        git)     cmd_git "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)       die "Onbekend commando: '$cmd'\nRun 'dotf help' voor een overzicht" ;;
+    esac
+}
+
+main "$@"
