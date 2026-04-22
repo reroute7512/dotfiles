@@ -25,7 +25,7 @@ alias mv='mv -iv'               # bevestiging bij overschrijven
 alias rm='rm -iv'               # bevestiging bij verwijderen
 alias ports='ss -tulpn'
 alias myip='curl -s ifconfig.me'
-
+alias cls='clear'
 
 # User specific aliases and functions
 if [ -d ~/.bashrc.d ]; then
